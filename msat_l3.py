@@ -45,7 +45,7 @@ def main():
     l3_data = F_wrapper_l3(instrum='MethaneSAT', product='CH4',grid_size=args.grid_size,
             l2_path_pattern=args.l2_input_dir+'/*',
             start_date_array=[start_time], end_date_array=[end_time], if_use_presaved_l2g=False,
-            west=args.west, east=args.east, south=args.south, north=args.north)
+            west=args.west, east=args.east, south=args.south, north=args.north, ncores=8, block_length=300)
     l3_data.plot(plot_field='XCH4')
     plt.savefig(os.path.join(args.output_dir, 'l3.png'))
 
