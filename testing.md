@@ -21,7 +21,7 @@ Run the following steps from the root directory of this github repo
 1. Run the python
 
     ```
-    python3 msat_l3.py -i testdata/golden/input -o /tmp --start-time 2016-10-01 --end-time 2016-10-30 -w -100 -e -95 -n 35 -s 30 --grid-size 0.001
+    python3 msat_l3.py -i data/test/input -o /tmp --start-time 2016-10-01 --end-time 2016-10-30 -w -100 -e -95 -n 35 -s 30 --grid-size 0.001
     ```
 
 1. Make sure there are no unexpected errors or warnings.
