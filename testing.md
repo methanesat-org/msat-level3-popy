@@ -4,6 +4,18 @@
 
 The data/test directory contains the inputs and expected outputs used to determine that everything works as expected when pulling in the latest version of the L2-L3 code.
 
+## One-time Setup
+<details>
+    <summary>Click to expand</summary>
+
+Create the conda environment. From the root directory of the github repo
+
+```
+conda env create -f environment.yml
+```
+</details>
+
+
 ## How to run
 
 #TODO: ## Automate the running of these tests
