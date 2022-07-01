@@ -19,12 +19,18 @@ Created on Sat Jan 26 15:50:30 2019
 2021/06/15: S5PSO2, l2_path_pattern, basemap
 2021/07/27: breaking change for F_wrapper_l3. l2_path_pattern prevails
 2021/09/27: add MethaneAIR and projection option
+2022/05/22: start adding l2_list (list of l2 paths) besides l2_path_pattern
+2022/06/07: updates for MethaneAIR level3 (merging, inflation)
+2022/06/20: flux divergence 2.0
 """
 
 import numpy as np
+np.seterr(divide='ignore', invalid='ignore')
 import datetime
-import os, sys
+import os, sys, glob
 import logging
+import inspect
+from calendar import monthrange
 
 def F_wrapper_l3(instrum,product,grid_size,
                  start_year=None,start_month=None,end_year=None,end_month=None,
@@ -33,20 +39,24 @@ def F_wrapper_l3(instrum,product,grid_size,
                  column_unit='umol/m2',
                  if_use_presaved_l2g=True,
                  subset_function=None,
+                 l2_list=None,
                  l2_path_pattern=None,
                  if_plot_l3=False,existing_ax=None,
                  ncores=0,block_length=200,
                  subset_kw=None,plot_kw=None,
                  start_date_array=None,
                  end_date_array=None,
-                 proj=None):
+                 proj=None,
+                 nudge_grid_origin=None,
+                 k1=None,k2=None,k3=None,inflatex=None,inflatey=None,
+                 flux_kw=None,flux_grid_size=None):
     '''
     instrum:
         instrument name
     product:
         product name, usually the name of molecule (NO2, CH4, NH3, HCHO, etc.)
     grid_size:
-        grid size in degree
+        grid size, should be <~ 0.5 l2 pixel size
     start/end_year/month/day:
         recommend to use start/end_date_array instead
     west/east/south/north:
@@ -57,6 +67,8 @@ def F_wrapper_l3(instrum,product,grid_size,
         if True, use presaved .mat files, otherwise read/subset raw level 2 files
     subset_function:
         function name in popy object to subset level 2 data. should be string like "F_subset_S5PNO2"
+    l2_list:
+        a list of level 2 file paths. If provided, l2_path_pattern will be ignored.
     l2_path_pattern:
         a format string indicating the path structure of level 2 (or level 2g if if_use_presaved_l2g is True). e.g.,
         r'C:/data/*O2-CH4_%Y%m%dT*CO2proxy.nc' for level 2 or r'C:/data/CONUS_%Y_%m.mat' for level 2g
@@ -69,27 +81,61 @@ def F_wrapper_l3(instrum,product,grid_size,
     plot_kw:
         arguments input to Level3_Data.plot function
     start/end_date_array:
-        each element should be the start/end datetime.date. e.g., to average all July data in 2005-2021,
+        each element should be the start/end datetime.date(). e.g., to average all July data in 2005-2021,
         start_date_array = [datetime.date(y,7,1) for y in range(2005,2022)],
         end_date_array = [datetime.date(y,7,31) for y in range(2005,2022)],
     proj:
         if provided, should be a pyproj.Proj object
+    nudge_grid_origin:
+        does nothing if none. if integar, adjust west and south to multiplies of grid_size. useful when tiling l3_data together
+    k1/2/3:
+        shape exponents for the 2d super gaussian. see https://doi.org/10.5194/amt-11-6679-2018, fig. 5
+    inflatex/y:
+        options to inflate level2 pixels across (x) and along (y) track
+    flux_kw:
+        arguments input to F_calculate_horizontal_flux function, will trigger flux calculation
+    flux_grid_size:
+        grid size on which to calculate flux divergence, should be >~ 1 l2 pixel size
     output:
         if if_plot_l3 is False, return a Level3_Data object. otherwise return a dictionary containing the 
         Level3_Data object and the figout dictionary
     '''
     subset_kw = subset_kw or {}
     plot_kw = plot_kw or {}
-
-    from calendar import monthrange
+    if flux_kw is not None:
+        logging.info('flux calculation is enabled using wind fields {} and {}'.format(flux_kw['x_wind_field'],flux_kw['y_wind_field']))
+        do_flux = True
+        flux_grid_size = flux_grid_size or grid_size
+    else:
+        do_flux = False
+    
+    if nudge_grid_origin is not None:
+        step_grid_size = nudge_grid_origin*grid_size
+        west1 = np.floor(west/step_grid_size)*step_grid_size
+        south1 = np.floor(south/step_grid_size)*step_grid_size
+        logging.info('west will be adjusted from {} to {}'.format(west,west1))
+        west = west1
+        logging.info('south will be adjusted from {} to {}'.format(south,south1))
+        south = south1
+    if l2_list is not None and l2_path_pattern is not None:
+        logging.info('both l2_list and l2_path_pattern are provided. l2_path_pattern will be overwritten')
+        l2_path_pattern = None
+    
     if start_year is None:
         if start_date_array is None:
-            logging.error('start/end_date_array have to be provided')
-            return
+            if subset_function in ['F_subset_combined_MethaneAIR'] and 'alongtrack_mask' in subset_kw.keys():
+                logging.warning('no time constraint will be applied')
+                # create a dummy time
+                start_date_array = np.array([datetime.datetime(1900,1,1)])
+                end_date_array = np.array([datetime.datetime(2100,1,1)])
+            else:
+                logging.error('start/end_date_array have to be provided')
+                return
     else:
         logging.warning('please use start/end_date_array instead of setting year/month/day')
         if end_day is None:
             end_day = monthrange(end_year,end_month)[-1]
+    
     if start_date_array is not None:
         if start_year is not None:
             logging.info('Array of date provided, superseding start/end_year/month/day')
@@ -99,14 +145,18 @@ def F_wrapper_l3(instrum,product,grid_size,
     else:
         start_date_array = np.array([datetime.date(start_year,start_month,start_day)])
         end_date_array = np.array([datetime.date(end_year,end_month,end_day)])
+    
     if isinstance(start_date_array[0],datetime.datetime):
         start_dt_array = start_date_array
         end_dt_array = end_date_array
     elif isinstance(start_date_array[0],datetime.date):
         start_dt_array = np.array([datetime.datetime(d.year,d.month,d.day) for d in start_date_array])
         end_dt_array = np.array([datetime.datetime(d.year,d.month,d.day) for d in end_date_array])
+    
     l3_data = Level3_Data(proj=proj)
+    
     for idate in range(len(start_date_array)):
+        
         start_date = start_date_array[idate]
         end_date = end_date_array[idate]
         
@@ -118,16 +168,27 @@ def F_wrapper_l3(instrum,product,grid_size,
                  start_hour=start_dt.hour,start_minute=start_dt.minute,start_second=start_dt.second,
                  end_year=end_dt.year,end_month=end_dt.month,end_day=end_dt.day,
                  end_hour=end_dt.hour,end_minute=end_dt.minute,end_second=end_dt.second,
-                 west=west,east=east,south=south,north=north,proj=proj)
+                 west=west,east=east,south=south,north=north,proj=proj,
+                 k1=k1,k2=k2,k3=k3,inflatex=inflatex,inflatey=inflatey,flux_grid_size=flux_grid_size)
         if not if_use_presaved_l2g:
             if subset_function is None:
                 subset_function = o.default_subset_function
-            try:
-                getattr(o, subset_function)(l2_path_pattern=l2_path_pattern,**subset_kw)
-            except Exception as e:
-                logging.warning(e)
-                logging.info('subset function is not updated yet to take l2_path_pattern input')
-                getattr(o, subset_function)(**subset_kw)
+            
+            subset_arg_list = inspect.getfullargspec(getattr(o,subset_function)).args
+            
+            if 'l2_path_pattern' in subset_arg_list and \
+                'l2_path_pattern' not in subset_kw.keys() and \
+                l2_path_pattern is not None:
+                subset_kw['l2_path_pattern'] = l2_path_pattern
+            
+            if 'l2_list' in subset_arg_list and \
+                'l2_list' not in subset_kw.keys() and \
+                l2_list is not None:
+                subset_kw['l2_list'] = l2_list
+            
+            getattr(o, subset_function)(**subset_kw)
+            if do_flux:
+                o.F_calculate_horizontal_flux(**flux_kw)
             # xch4 or xco2 products
             x_set = set(o.oversampling_list).intersection({'xch4','XCH4','XCO2','xco2'})
             if len(x_set)>0:
@@ -168,10 +229,23 @@ def F_wrapper_l3(instrum,product,grid_size,
                         logging.warning(l2g_path+' does not exist!')
                         continue
                     o.F_mat_reader(l2g_path)
+                    if do_flux:
+                        o.F_calculate_horizontal_flux(**flux_kw)
                     #kludge for CrIS
                     if instrum == 'CrIS':
                         mask = (o.l2g_data['column_amount'] > 0) & (o.l2g_data['column_uncertainty'] > 0)
                         o.l2g_data = {k:v[mask,] for (k,v) in o.l2g_data.items()}
+                    
+                    # xch4 or xco2 products
+                    x_set = set(o.oversampling_list).intersection({'xch4','XCH4','XCO2','xco2'})
+                    if len(x_set)>0:
+                        if o.default_column_unit == 'mol/mol' and column_unit in ['ppb','ppbv','nmol/mol']:
+                            for x_something in x_set:
+                                o.l2g_data[x_something] = o.l2g_data[x_something]*1e9
+                        if o.default_column_unit == 'mol/mol' and column_unit in ['ppm','ppmv','umol/mol']:
+                            for x_something in x_set:
+                                o.l2g_data[x_something] = o.l2g_data[x_something]*1e6
+                    
                     if 'column_amount' in o.oversampling_list:
                         if o.default_column_unit == 'molec/cm2' and column_unit == 'mol/m2':
                             o.l2g_data['column_amount'] = o.l2g_data['column_amount']/6.02214e19
@@ -190,6 +264,10 @@ def F_wrapper_l3(instrum,product,grid_size,
         l3_data = l3_data.merge(l3_data0)
     if hasattr(l3_data,'check'):
         l3_data.check()
+    if 'flux_div' not in l3_data.keys() and do_flux:
+        if flux_grid_size > grid_size:
+            l3_data = l3_data.block_reduce(flux_grid_size)
+        l3_data.calculate_flux_divergence(**o.calculate_flux_divergence_kw)
     if if_plot_l3 and hasattr(l3_data,'plot'):
         figout = l3_data.plot(existing_ax=existing_ax,**plot_kw)
     else:
@@ -249,6 +327,8 @@ def F_download_gesdisc_l2(txt_fn,
                 break
             try:
                 tmp = re.findall(re_pattern,l)
+                if len(tmp) == 0:
+                    continue
                 orbit_start_dt = dt.datetime.strptime(tmp[orbit_start_dt_idx],dt_pattern)
                 if orbit_end_dt_idx is not None:
                     orbit_end_dt = dt.datetime.strptime(tmp[orbit_end_dt_idx],dt_pattern)
@@ -717,7 +797,7 @@ def F_interp_era5_3D(sounding_lon,sounding_lat,sounding_datenum,
 def F_interp_era5(sounding_lon,sounding_lat,sounding_datenum,\
                   era5_dir='/mnt/Data2/ERA5/',\
                   interp_fields=None,\
-                  fn_header='CONUS'):
+                  fn_header=None):
     """
     sample a field from era5 data in .nc format. 
     see era5.py for era5 downloading/subsetting
@@ -728,7 +808,7 @@ def F_interp_era5(sounding_lon,sounding_lat,sounding_datenum,\
     sounding_datenum:
         time for interpolation in matlab datenum double format
     era5_dir:
-        directory where subset era5 data in .nc are saved
+        directory where subset era5 data in .nc are saved, if fn_header is None, use as file path pattern
     interp_fields:
         variables to interpolate from era5, only 2d fields are supported
     fn_header:
@@ -748,10 +828,19 @@ def F_interp_era5(sounding_lon,sounding_lat,sounding_datenum,\
     era5_data = {}
     iday = 0
     for DATE in DATES:
-        fn = os.path.join(era5_dir,DATE.strftime('Y%Y'),\
-                                   DATE.strftime('M%m'),\
-                                   DATE.strftime('D%d'),\
-                                   fn_header+'_2D_'+DATE.strftime('%Y%m%d')+'.nc')
+        if fn_header is None:
+            flist = glob.glob(DATE.strftime(era5_dir))
+            if len(flist) == 0:
+                logging.warning('no file found on '+DATE.strftime('%Y%m%d'))
+                continue
+            if len(flist) > 1:
+                logging.warning('{} files found on {}, using the first one'.format(len(flist),DATE.strftime('%Y%m%d')))
+            fn = flist[0]
+        else:
+            fn = os.path.join(era5_dir,DATE.strftime('Y%Y'),\
+                                       DATE.strftime('M%m'),\
+                                       DATE.strftime('D%d'),\
+                                       fn_header+'_2D_'+DATE.strftime('%Y%m%d')+'.nc')
         if not era5_data:
             nc_out = F_ncread_selective(fn,np.concatenate(
                     (interp_fields,['latitude','longitude','time'])))
@@ -793,7 +882,80 @@ def F_interp_era5(sounding_lon,sounding_lat,sounding_datenum,\
                                 era5_data[fn],bounds_error=False,fill_value=np.nan)
         sounding_interp[fn] = my_interpolating_function((sounding_lon,sounding_lat,sounding_datenum))
     return sounding_interp
+
+def F_interp_hrrr_mat(sounding_lon,sounding_lat,sounding_datenum,
+                      file_pattern='/projects/academic/kangsun/data/hrrr/%Y%m%d/hrrr_sfc_uv.mat',
+                      interp_fields=None):
+    '''interpolate fields from hrrr data, concatenated as daily mat files
+    sounding_lon:
+        longitude for interpolation
+    sounding_lat:
+        latitude for interpolation
+    sounding_datenum:
+        time for interpolation in matlab datenum double format
+    file_pattern:
+        pattern of daily met files, similar to l2_path_pattern
+    interp_fields:
+        variables to interpolate from hrrr, only 2d fields are supported
+    created on 2022/06/13
+    '''
+    from scipy.io import loadmat
+    from scipy.interpolate import RegularGridInterpolator
+    from pyproj import Proj
+    import glob
+
+    interp_fields = interp_fields or ['u80','v80']
+    p2 = Proj(proj='lcc',R=6371.229, lat_1=38.5, lat_2=38.5,lon_0=262.5,lat_0=38.5)
+    sounding_x,sounding_y = p2(sounding_lon,sounding_lat)
+    start_datenum = np.amin(sounding_datenum)
+    end_datenum = np.amax(sounding_datenum)
+    start_datetime = datedev_py(start_datenum)
+    end_datetime = datedev_py(end_datenum)
     
+    days = (end_datetime-start_datetime).days+1
+    DATES = [start_datetime + datetime.timedelta(days=d) for d in range(days)]
+    hrrr_data = {}
+    
+    for date in DATES:
+        flist = glob.glob(date.strftime(file_pattern))
+        if len(flist) == 0:
+            logging.warning('no file found on '+date.strftime('%Y%m%d'))
+            continue
+        if len(flist) > 1:
+            logging.warning('{} files found on {}, using the first one'.format(len(flist),date.strftime('%Y%m%d')))
+        fn = flist[0]
+        
+        if not hrrr_data:
+            d = loadmat(fn,squeeze_me=True)
+            hrrr_data['x'] = d['x']
+            hrrr_data['y'] = d['y']
+            
+            hrrr_data['datenum'] = d['datenum']
+            for field in interp_fields:
+                # was read in as 3-d array in time, y, x; transpose to x, y, time
+                hrrr_data[field] = d[field].transpose((2,1,0))
+                
+        else:
+            d = loadmat(fn,squeeze_me=True)
+            hrrr_data['datenum'] = np.append(hrrr_data['datenum'],d['datenum'])
+            for field in interp_fields:
+                # was read in as 3-d array in time, y, x; transpose to x, y, time
+                hrrr_data[field] = np.append(hrrr_data[field],d[field].transpose((2,1,0)),axis=2)
+        
+        
+    sounding_interp = {}
+    if not hrrr_data:
+        for fn in interp_fields:
+            sounding_interp[fn] = sounding_lon*np.nan
+        return sounding_interp
+    # interpolate
+    for fn in interp_fields:
+        my_interpolating_function = \
+        RegularGridInterpolator((hrrr_data['x'],hrrr_data['y'],hrrr_data['datenum']),\
+                                hrrr_data[fn],bounds_error=False,fill_value=np.nan)
+        sounding_interp[fn] = my_interpolating_function((sounding_x,sounding_y,sounding_datenum))
+    return sounding_interp
+
 def F_interp_geos_mat(sounding_lon,sounding_lat,sounding_datenum,\
                   geos_dir='/mnt/Data2/GEOS/s5p_interp/',\
                   interp_fields=None,\
@@ -1003,6 +1165,93 @@ def F_interp_narr_mat(sounding_lon,sounding_lat,sounding_datenum,\
         sounding_interp[fn] = my_interpolating_function((sounding_x,sounding_y,sounding_datenum))
     return sounding_interp
 
+def pixel_adjust_func(lonr,latr,lonc,latc,threshold_m=3,inflatex=1,inflatey=1):
+    '''
+    function to manipulate pixel corners if you don't like them
+    lonr, latr:
+        (nl2, 4) arrays, pixel corners
+    lonc, latc:
+        (nl2,) arrays, pixel centers
+    threshold_m:
+        if pixel fwhmx or fwhmx are smaller than this value, make it this value
+    inflatex/y:
+        stretch the pixels across track (x) or along track (y)
+    return:
+        updated lonr and latr
+    '''
+    import cv2
+    lonr_new = lonr.copy()
+    latr_new = latr.copy()
+    count = 0
+    for il2 in range(len(lonc)):
+        
+        xr = (lonr[il2,:]-lonc[il2])*111e3*np.cos(latc[il2]/180*np.pi)
+        yr = (latr[il2,:]-latc[il2])*111e3
+
+        edgecenterx = np.mean(np.column_stack((xr,xr[[1,2,3,0]])),axis=1)
+        edgecentery = np.mean(np.column_stack((yr,yr[[1,2,3,0]])),axis=1)
+
+        fwhmy = np.linalg.norm([edgecenterx[0]-edgecenterx[2],edgecentery[0]-edgecentery[2]])
+        fwhmx = np.linalg.norm([edgecenterx[1]-edgecenterx[3],edgecentery[1]-edgecentery[3]])
+        
+        if fwhmx >= threshold_m and fwhmy >= threshold_m and inflatex == 1 and inflatey == 1:
+            continue
+        
+        if fwhmx < threshold_m:
+            e0e2v = np.array([edgecenterx[2]-edgecenterx[0],edgecentery[2]-edgecentery[0]])
+            e0c0v = np.array([e0e2v[1],-e0e2v[0]])/np.linalg.norm(e0e2v)
+            e0 = np.array([edgecenterx[0],edgecentery[0]])
+            e2 = np.array([edgecenterx[2],edgecentery[2]])
+            c0 = e0+e0c0v
+            c1 = e0-e0c0v
+            c2 = e2-e0c0v
+            c3 = e2+e0c0v
+            xr = np.array([c0[0],c1[0],c2[0],c3[0]])
+            yr = np.array([c0[1],c1[1],c2[1],c3[1]])
+            edgecenterx = np.mean(np.column_stack((xr,xr[[1,2,3,0]])),axis=1)
+            edgecentery = np.mean(np.column_stack((yr,yr[[1,2,3,0]])),axis=1)
+
+            fwhmy = np.linalg.norm([edgecenterx[0]-edgecenterx[2],edgecentery[0]-edgecentery[2]])
+            fwhmx = np.linalg.norm([edgecenterx[1]-edgecenterx[3],edgecentery[1]-edgecentery[3]])
+        
+        if fwhmy < threshold_m:
+            e1e3v = np.array([edgecenterx[3]-edgecenterx[1],edgecentery[3]-edgecentery[1]])
+            e1c1v = np.array([e1e3v[1],-e1e3v[0]])/np.linalg.norm(e1e3v)
+            e1 = np.array([edgecenterx[1],edgecentery[1]])
+            e3 = np.array([edgecenterx[3],edgecentery[3]])
+            c1 = e1+e1c1v
+            c2 = e1-e1c1v
+            c0 = e3+e1c1v
+            c3 = e3-e1c1v
+            xr = np.array([c0[0],c1[0],c2[0],c3[0]])
+            yr = np.array([c0[1],c1[1],c2[1],c3[1]])
+            edgecenterx = np.mean(np.column_stack((xr,xr[[1,2,3,0]])),axis=1)
+            edgecentery = np.mean(np.column_stack((yr,yr[[1,2,3,0]])),axis=1)
+
+            fwhmy = np.linalg.norm([edgecenterx[0]-edgecenterx[2],edgecentery[0]-edgecentery[2]])
+            fwhmx = np.linalg.norm([edgecenterx[1]-edgecenterx[3],edgecentery[1]-edgecentery[3]])
+            
+        if inflatex != 1 or inflatey != 1:
+            xrr = np.array([-fwhmx,fwhmx,fwhmx,-fwhmx])/2
+            yrr = np.array([fwhmy,fwhmy,-fwhmy,-fwhmy])/2
+
+            fwhmx_new = inflatex*fwhmx
+            fwhmy_new = inflatey*fwhmy
+
+            xrr_new = np.array([-fwhmx_new,fwhmx_new,fwhmx_new,-fwhmx_new])/2
+            yrr_new = np.array([fwhmy_new,fwhmy_new,-fwhmy_new,-fwhmy_new])/2
+            
+            tform = cv2.getPerspectiveTransform(np.float32(np.column_stack((xrr,yrr))),
+                                               np.float32(np.column_stack((xr,yr))))
+            tmp = np.float32(np.column_stack((xrr_new,yrr_new,np.ones_like(yrr_new)))).dot(tform.T)
+            xr = tmp[:,0]
+            yr = tmp[:,1]
+           
+        lonr_new[il2,:] = xr/(111e3*np.cos(latc[il2]/180*np.pi))+lonc[il2]
+        latr_new[il2,:] = yr/111e3+latc[il2]
+    
+    return lonr_new, latr_new
+
 def F_ncread_selective(fn,varnames,varnames_short=None):
     """
     very basic netcdf reader, similar to F_ncread_selective.m
@@ -1084,7 +1333,7 @@ def F_block_regrid_wrapper(args):
 def F_block_regrid_ccm(l2g_data,xmesh,ymesh,
                        oversampling_list,pixel_shape,error_model,
                        k1,k2,k3,xmargin,ymargin,
-                       iblock=1,verbose=False):
+                       iblock=1,verbose=False,inflatex=None,inflatey=None):
     '''
     a more compact version of F_regrid_ccm designed for parallel regridding
     l2g_data:
@@ -1107,6 +1356,10 @@ def F_block_regrid_ccm(l2g_data,xmesh,ymesh,
         factors extending beyond pixel boundary
     iblock:
         indicate block in parallel regridding
+    verbose:
+        if print diagnostics
+    inflatex/y:
+        inflate pixels across (x) and along (y) track
     created on 2020/07/19
     '''
     if len(l2g_data['latc']) == 0:
@@ -1125,6 +1378,8 @@ def F_block_regrid_ccm(l2g_data,xmesh,ymesh,
     from shapely.geometry import Polygon
     sg_kfacx = 2*(np.log(2)**(1/k1/k3))
     sg_kfacy = 2*(np.log(2)**(1/k2/k3))
+    inflatex = inflatex or 1
+    inflatey = inflatey or 1
     nvar_oversampling = len(oversampling_list)
     nl2 = len(l2g_data['latc'])
     xgrid = xmesh[0,:]
@@ -1278,8 +1533,8 @@ def F_block_regrid_ccm(l2g_data,xmesh,ymesh,
         if(error_model == 'log') and (oversampling_list[n] == 'column_amount'):
             grid_flds[:,n] = np.log10(grid_flds[:,n])
         #t1 = time.time()
-    sg_wx = fwhmx/sg_kfacx
-    sg_wy = fwhmy/sg_kfacy
+    sg_wx = inflatex*fwhmx/sg_kfacx
+    sg_wy = inflatey*fwhmy/sg_kfacy
     # Init point counter for logger
     count = 0
     for il2 in range(nl2):
@@ -1324,7 +1579,7 @@ def F_block_regrid_ccm(l2g_data,xmesh,ymesh,
         
     logging.info('block %d'%iblock+' completed at '+datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S'))
     l3_data = {}
-    np.seterr(divide='ignore', invalid='ignore')
+    #np.seterr(divide='ignore', invalid='ignore')
     for ikey in range(len(oversampling_list)):
         l3_data[oversampling_list[ikey]] = sum_aboves[ikey][:,:].squeeze()\
         /total_sample_weight
@@ -1364,6 +1619,18 @@ def arange_(lower,upper,step,dtype=None):
         upper_new += step
         npnt += 1    
     return np.linspace(lower,upper_new,int(npnt),dtype=dtype)
+
+def F_center2edge(lon,lat):
+    '''
+    function to shut up complain of pcolormesh like 
+    MatplotlibDeprecationWarning: shading='flat' when X and Y have the same dimensions as C is deprecated since 3.3.
+    create grid edges from grid centers
+    '''
+    res=np.mean(np.diff(lon))
+    lonr = np.append(lon-res/2,lon[-1]+res/2)
+    res=np.mean(np.diff(lat))
+    latr = np.append(lat-res/2,lat[-1]+res/2)
+    return lonr,latr
 
 class Level3_Data(dict):
     '''
@@ -1421,6 +1688,149 @@ class Level3_Data(dict):
             self['lonmesh'] = lonmesh
             self['latmesh'] = latmesh
     
+    def calculate_flux_divergence(self,write_diagnostic=False,remove_wind_div=False,
+                                  finite_difference_order=2):
+        if self.proj is not None:
+            self.logger.error('projection is not supported in flux divergence calculation yet')
+            return
+        
+        # get xy and rs divergences given the xy and rs decomposition of vector
+        def F_divs(fe,fn,fne,fnw,dy,dx_vec,dd_vec):
+            dfedx = np.full_like(fe,np.nan)
+            dfedx[:,1:-1] = (fe[:,2:]-fe[:,0:-2])/(2*np.broadcast_to(dx_vec[:,np.newaxis],fe[:,1:-1].shape))
+
+            dfndy = np.full_like(fn,np.nan)
+            dfndy[1:-1,] = (fn[2:,]-fn[0:-2,])/(2*dy)
+
+            dfnedr = np.full_like(fne,np.nan)
+            dfnedr[1:-1,1:-1] = (fne[2:,2:]-fne[0:-2,0:-2])/(2*np.broadcast_to(dd_vec[1:-1,np.newaxis],fne[1:-1,1:-1].shape))
+
+            dfnwds = np.full_like(fnw,np.nan)
+            dfnwds[1:-1,1:-1] = (fnw[2:,0:-2]-fnw[0:-2,2:])/(2*np.broadcast_to(dd_vec[1:-1,np.newaxis],fnw[1:-1,1:-1].shape))
+
+            div_xy = dfedx+dfndy
+            div_rs = dfnedr+dfnwds
+            return div_xy,div_rs        
+        
+        # 4th-order central finite difference
+        def F_divs_4(fe,fn,fne,fnw,dy,dx_vec,dd_vec):
+            dfedx = np.full_like(fe,np.nan)
+            dfedx[:,2:-2] = (-fe[:,4:]+8*fe[:,3:-1]-8*fe[:,1:-3]+fe[:,0:-4])/\
+            (12*np.broadcast_to(dx_vec[:,np.newaxis],fe[:,2:-2].shape))
+
+            dfndy = np.full_like(fn,np.nan)
+            dfndy[2:-2,] = (-fn[4:,]+8*fn[3:-1,]-8*fn[1:-3,]+fn[0:-4,])/(12*dy)
+
+            dfnedr = np.full_like(fne,np.nan)
+            dfnedr[2:-2,2:-2] = (-fne[4:,4:]+8*fne[3:-1,3:-1]-8*fne[1:-3,1:-3]+fne[0:-4,0:-4])/\
+            (12*np.broadcast_to(dd_vec[2:-2,np.newaxis],fne[2:-2,2:-2].shape))
+
+            dfnwds = np.full_like(fnw,np.nan)
+            dfnwds[2:-2,2:-2] = (-fnw[4:,0:-4]+8*fnw[3:-1,1:-3]-8*fnw[1:-3,3:-1]+fnw[0:-4,4:])/\
+            (12*np.broadcast_to(dd_vec[2:-2,np.newaxis],fnw[2:-2,2:-2].shape))
+
+            div_xy = dfedx+dfndy
+            div_rs = dfnedr+dfnwds
+            return div_xy,div_rs
+        
+        # y-grid size in m
+        dy = 111e3*self.grid_size
+        # x-grid size in m
+        dx_vec = np.cos(self['ygrid']/180*np.pi)*111e3*self.grid_size
+        # diagonal grid points distance in m
+        dd_vec = np.sqrt(np.square(dx_vec)+dy**2)
+        
+        div_xy,div_rs = F_divs(self['flux_e'],self['flux_n'],self['flux_ne'],self['flux_nw'],dy,dx_vec,dd_vec)
+
+        if finite_difference_order == 4:
+            div_xy_4,div_rs_4 = F_divs_4(self['flux_e'],self['flux_n'],self['flux_ne'],self['flux_nw'],dy,dx_vec,dd_vec)
+            div_xy[~np.isnan(div_xy_4)] = div_xy_4[~np.isnan(div_xy_4)]
+            div_rs[~np.isnan(div_rs_4)] = div_rs_4[~np.isnan(div_rs_4)]
+        
+        flux_div = np.nanmean(np.array([div_xy,div_rs]),axis=0)
+        flux_div[np.isnan(div_xy) & np.isnan(div_rs)] = np.nan
+        
+        # calculate wind divergence
+        if 'vcd' not in self.keys():
+            vcd = self['column_amount']
+        else:
+            vcd = self['vcd']
+        div_wind_xy,div_wind_rs = F_divs(self['flux_e']/vcd,self['flux_n']/vcd,
+                                         self['flux_ne']/vcd,self['flux_nw']/vcd,
+                                         dy,dx_vec,dd_vec)
+        
+        if finite_difference_order == 4:
+            div_wind_xy_4,div_wind_rs_4 = F_divs_4(self['flux_e']/vcd,self['flux_n']/vcd,self['flux_ne']/vcd,self['flux_nw']/vcd,dy,dx_vec,dd_vec)
+            div_wind_xy[~np.isnan(div_wind_xy_4)] = div_wind_xy_4[~np.isnan(div_wind_xy_4)]
+            div_wind_rs[~np.isnan(div_wind_rs_4)] = div_wind_rs_4[~np.isnan(div_wind_rs_4)]
+        
+        wind_div = np.nanmean(np.array([div_wind_xy,div_wind_rs]),axis=0)*vcd
+        wind_div[np.isnan(div_wind_xy) & np.isnan(div_wind_rs)] = np.nan
+        
+        if remove_wind_div:
+            flux_div -= wind_div
+        
+        # calculate terrain gradient dot wind term
+        if 'surface_altitude' in self.keys():
+            z0 = self['surface_altitude']
+        elif 'terrain_height' in self.keys():
+            z0 = self['terrain_height']
+        else:
+            self.logger.info('no surface altitude found, no wind dot terrain gradient calculation')
+            z0 = None
+        if z0 is not None:
+            dz0dx = np.full_like(z0,np.nan)
+            dz0dx[:,1:-1] = (z0[:,2:]-z0[:,0:-2])/(2*np.broadcast_to(dx_vec[:,np.newaxis],z0[:,1:-1].shape))
+
+            dz0dy = np.full_like(z0,np.nan)
+            dz0dy[1:-1,] = (z0[2:,]-z0[0:-2,])/(2*dy)
+            self['uv_dot_gradz0'] = dz0dx*self['flux_e']/vcd + dz0dy*self['flux_n']/vcd
+            
+        self['flux_div'] = flux_div
+        self['wind_div'] = wind_div
+        if write_diagnostic:
+            self['div_xy'] = div_xy
+            self['div_rs'] = div_rs
+            self['div_wind_xy'] = div_wind_xy
+            self['div_wind_rs'] = div_wind_rs
+        
+    def remesh(self,xgrid,ygrid,xmesh=None,ymesh=None):
+        from scipy.interpolate import RegularGridInterpolator
+        grid_sizex = np.median(np.diff(xgrid))
+        grid_sizey = np.median(np.diff(ygrid))
+        if not np.isclose(grid_sizex,grid_sizey,rtol=1e-3):
+            self.logger.warning('x grid size {} and y grid size {} are inconsistent!'.format(grid_sizex,grid_sizey))
+        new_grid_size = np.mean([grid_sizex,grid_sizey])
+        
+        self.logger.info('input grid_size is {}'.format(self.grid_size))
+        self.logger.info('remeshing to grid_size of {}'.format(new_grid_size))
+        if new_grid_size >= 2*self.grid_size:
+            l3_data = self.block_reduce(new_grid_size)
+        else:
+            l3_data = self
+        if xmesh is None:
+            xmesh,ymesh = np.meshgrid(xgrid,ygrid)
+        l3_new = Level3_Data(instrum=l3_data.instrum,product=l3_data.product,
+                             start_python_datetime=l3_data.start_python_datetime,
+                             end_python_datetime=l3_data.end_python_datetime,
+                             proj=l3_data.proj,oversampling_list=l3_data.oversampling_list)
+        l3_new.assimilate({'xgrid':xgrid,'ygrid':ygrid,'xmesh':xmesh,'ymesh':ymesh})
+        for key in l3_data.keys():
+            if key in ['xgrid','ygrid','nrows','nrow','ncols','ncol','xmesh','ymesh','lonmesh','latmesh']:
+                continue
+            elif key in ['total_sample_weight','pres_total_sample_weight','num_samples','pres_num_samples']:
+                f = RegularGridInterpolator((l3_data['ygrid'],l3_data['xgrid']),
+                                            l3_data[key],bounds_error=False,fill_value=0.,method='nearest')
+                interpolated_fields = f((ymesh,xmesh))
+                interpolated_fields[np.isnan(interpolated_fields)] = 0.
+            else:
+                f = RegularGridInterpolator((l3_data['ygrid'],l3_data['xgrid']),
+                                            l3_data[key],bounds_error=False,fill_value=np.nan,method='nearest')
+                interpolated_fields = f((ymesh,xmesh))
+            l3_new.add(key,interpolated_fields)
+        l3_new.check()
+        return l3_new
+    
     def merge(self,l3_data1):
         if len(self.keys()) == 0:
             self.logger.info('orignial level 3 is empty. adopting attributes of the added level 3.')
@@ -1471,22 +1881,25 @@ class Level3_Data(dict):
         for key in common_keys:
             v0 = self[key]
             v1 = l3_data1[key]
-            v0[np.isnan(v0)] = 0.
-            v1[np.isnan(v1)] = 0.
+            
             if key in ['total_sample_weight','pres_total_sample_weight','num_samples','pres_num_samples']:
+                v0[np.isnan(v0)] = 0.
+                v1[np.isnan(v1)] = 0.
                 l3_data[key] = v0+v1
             elif key in initial_only_keys:
                 l3_data[key] = v0
             elif key == 'cloud_pressure':
-                l3_data[key] = (v0*self['pres_total_sample_weight']
-                +v1*l3_data1['pres_total_sample_weight'])\
-                /(self['pres_total_sample_weight']
-                +l3_data1['pres_total_sample_weight'])
+                above = np.nansum(np.array([(v0*self['pres_total_sample_weight'],v1*l3_data1['pres_total_sample_weight'])]),axis=0)
+                below = np.nansum(np.array([self['pres_total_sample_weight'],l3_data1['pres_total_sample_weight']]),axis=0)
+                l3_data[key] = above/below
             else:
-                l3_data[key] = (v0*self['total_sample_weight']
-                +v1*l3_data1['total_sample_weight'])\
-                /(self['total_sample_weight']
-                +l3_data1['total_sample_weight'])
+                weight0 = self['total_sample_weight'].copy()
+                weight0[np.isnan(v0)] = 0
+                weight1 = l3_data1['total_sample_weight'].copy()
+                weight1[np.isnan(v1)] = 0
+                above = np.nansum(np.array([v0*weight0,v1*weight1]),axis=0)
+                below = np.nansum(np.array([weight0,weight1]),axis=0)
+                l3_data[key] = above/below
         return l3_data
     
     def read_mat(self,l3_filename,
@@ -1777,7 +2190,7 @@ class Level3_Data(dict):
         self.check()
         if new_grid_size <= self.grid_size:
             self.logger.warning('provide a grid size larger than {}!'.format(self.grid_size))
-            return
+            return self
         from skimage.measure import block_reduce
         reduce_factor = np.int(np.rint(new_grid_size/self.grid_size))
         if reduce_factor == 1:
@@ -1816,9 +2229,12 @@ class Level3_Data(dict):
                 k not in ['xmesh','ymesh','lonmesh','latmesh',
                           'total_sample_weight','pres_total_sample_weight','num_samples','pres_num_samples']:
                 self.logger.info('block reducing field {}'.format(k))
+                total_sample_weight = self['total_sample_weight'].copy()
+                total_sample_weight[np.isnan(self[k])] = np.nan
+                aggregated_weight = block_reduce(total_sample_weight[:nrows_trim,:ncols_trim],(reduce_factor,reduce_factor),func=np.nansum)
                 new_l3.add(k,block_reduce(self[k][:nrows_trim,:ncols_trim]*self['total_sample_weight'][:nrows_trim,:ncols_trim],
                                           (reduce_factor,reduce_factor),func=np.nansum)\
-                           /new_l3['total_sample_weight'])
+                           /aggregated_weight)
         new_l3.check()
         return new_l3
     
@@ -1890,9 +2306,9 @@ class Level3_Data(dict):
         if 'num_samples' in self.keys():
             plotdata[self['num_samples']<layer_threshold] = np.nan
         if self.proj is None and 'lonmesh' not in self.keys():
-            pc = ax.pcolormesh(xgrid,ygrid,plotdata,
+            pc = ax.pcolormesh(*F_center2edge(xgrid,ygrid),plotdata,
                            alpha=kwargs['alpha'],cmap=kwargs['cmap'],
-                           vmin=kwargs['vmin'],vmax=kwargs['vmax'],shading='gouraud')
+                           vmin=kwargs['vmin'],vmax=kwargs['vmax'])
         else:
             pc = ax.pcolormesh(self['lonmesh'],self['latmesh'],plotdata,
                            alpha=kwargs['alpha'],cmap=kwargs['cmap'],
@@ -1910,6 +2326,7 @@ class Level3_Data(dict):
         fig_output['cb'] = cb
         fig_output['pc'] = pc
         return fig_output
+    
     def plot(self,plot_field=None,
              existing_ax=None,draw_admin_level=1,
              layer_threshold=0.5,draw_colorbar=True,
@@ -1972,8 +2389,8 @@ class Level3_Data(dict):
         if 'num_samples' in self.keys():
             plotdata[self['num_samples']<layer_threshold] = np.nan
         if self.proj is None and 'lonmesh' not in self.keys():
-            pc = ax.pcolormesh(xgrid,ygrid,plotdata,transform=ccrs.PlateCarree(),
-                           alpha=kwargs['alpha'],cmap=kwargs['cmap'],vmin=kwargs['vmin'],vmax=kwargs['vmax'],shading='auto')
+            pc = ax.pcolormesh(*F_center2edge(xgrid,ygrid),plotdata,transform=ccrs.PlateCarree(),
+                           alpha=kwargs['alpha'],cmap=kwargs['cmap'],vmin=kwargs['vmin'],vmax=kwargs['vmax'])
         else:
             pc = ax.pcolormesh(self['lonmesh'],self['latmesh'],plotdata,transform=ccrs.PlateCarree(),
                            alpha=kwargs['alpha'],cmap=kwargs['cmap'],vmin=kwargs['vmin'],vmax=kwargs['vmax'],shading='auto')    
@@ -1996,7 +2413,8 @@ class popy(object):
                  start_hour=0,start_minute=0,start_second=0,\
                  end_year=2100,end_month=12,end_day=31,\
                  end_hour=23,end_minute=59,end_second=59,verbose=False,
-                 proj=None):
+                 proj=None,k1=None,k2=None,k3=None,inflatex=None,inflatey=None,
+                 flux_grid_size=None):
         
         self.instrum = instrum
         self.product = product
@@ -2004,9 +2422,9 @@ class popy(object):
         self.logger.info('creating an instance of popy')
         self.verbose = verbose
         if(instrum == "OMI"):
-            k1 = 4
-            k2 = 2
-            k3 = 1
+            k1 = k1 or 4
+            k2 = k2 or 2
+            k3 = k3 or 1
             error_model = "linear"
             oversampling_list = ['column_amount','albedo',\
                                  'cloud_fraction','cloud_pressure','terrain_height']
@@ -2024,9 +2442,9 @@ class popy(object):
             if product == 'NO2':
                 self.default_subset_function = 'F_subset_OMNO2'
         elif(instrum == "GOME-1"):
-            k1 = 4
-            k2 = 2
-            k3 = 1
+            k1 = k1 or 4
+            k2 = k2 or 2
+            k3 = k3 or 1
             error_model = "linear"
             oversampling_list = ['column_amount','albedo',\
                                  'amf','cloud_fraction','cloud_pressure','terrain_height']
@@ -2038,9 +2456,9 @@ class popy(object):
             self.default_subset_function = 'F_subset_MEaSUREs'
             self.default_column_unit = 'molec/cm2'
         elif(instrum == "SCIAMACHY"):
-            k1 = 4
-            k2 = 2
-            k3 = 1
+            k1 = k1 or 4
+            k2 = k2 or 2
+            k3 = k3 or 1
             error_model = "linear"
             oversampling_list = ['column_amount','albedo',\
                                  'amf','cloud_fraction','cloud_pressure','terrain_height']
@@ -2052,9 +2470,9 @@ class popy(object):
             self.default_subset_function = 'F_subset_MEaSUREs'
             self.default_column_unit = 'molec/cm2'
         elif(instrum == "GOME-2A"):
-            k1 = 4
-            k2 = 2
-            k3 = 1
+            k1 = k1 or 4
+            k2 = k2 or 2
+            k3 = k3 or 1
             error_model = "linear"
             oversampling_list = ['column_amount','albedo',\
                                  'amf','cloud_fraction','cloud_pressure','terrain_height']
@@ -2066,9 +2484,9 @@ class popy(object):
             self.default_subset_function = 'F_subset_MEaSUREs'
             self.default_column_unit = 'molec/cm2'
         elif(instrum == "GOME-2B"):
-            k1 = 4
-            k2 = 2
-            k3 = 1
+            k1 = k1 or 4
+            k2 = k2 or 2
+            k3 = k3 or 1
             error_model = "linear"
             oversampling_list = ['column_amount','albedo',\
                                  'amf','cloud_fraction','cloud_pressure','terrain_height']
@@ -2080,9 +2498,9 @@ class popy(object):
             self.default_subset_function = 'F_subset_MEaSUREs'
             self.default_column_unit = 'molec/cm2'
         elif(instrum == "OMPS-NPP"):
-            k1 = 6
-            k2 = 2
-            k3 = 3
+            k1 = k1 or 6
+            k2 = k2 or 2
+            k3 = k3 or 3
             error_model = "linear"
             oversampling_list = ['column_amount','albedo',\
                                  'amf','cloud_fraction','cloud_pressure','terrain_height']
@@ -2094,9 +2512,9 @@ class popy(object):
             self.default_subset_function = 'F_subset_MEaSUREs'
             self.default_column_unit = 'molec/cm2'
         elif(instrum == "OMPS-N20"):
-            k1 = 4
-            k2 = 2
-            k3 = 1
+            k1 = k1 or 4
+            k2 = k2 or 2
+            k3 = k3 or 1
             error_model = "linear"
             oversampling_list = ['column_amount','albedo',\
                                  'amf','cloud_fraction','cloud_pressure','terrain_height']
@@ -2109,9 +2527,9 @@ class popy(object):
             self.default_subset_function = 'F_subset_MEaSUREs'
             self.default_column_unit = 'molec/cm2'
         elif(instrum == "MethaneSAT"):
-            k1 = 4
-            k2 = 2
-            k3 = 1
+            k1 = k1 or 4
+            k2 = k2 or 2
+            k3 = k3 or 1
             error_model = "linear"
             oversampling_list = ['XCH4','XCO2','terrain_height']
             xmargin = 1.5
@@ -2122,9 +2540,9 @@ class popy(object):
             self.default_subset_function = 'F_subset_MethaneSAT'
             self.default_column_unit = 'mol/mol'         
         elif(instrum == "MethaneAIR"):
-            k1 = 2
-            k2 = 2
-            k3 = 1
+            k1 = k1 or 2
+            k2 = k2 or 2
+            k3 = k3 or 1
             error_model = "linear"
             oversampling_list = ['XCH4','XCO2','terrain_height']
             xmargin = 1.5
@@ -2135,33 +2553,33 @@ class popy(object):
             self.default_subset_function = 'F_subset_MethaneAIR'
             self.default_column_unit = 'mol/mol'
         elif(instrum == "TROPOMI"):
-            k1 = 4
-            k2 = 2
-            k3 = 1
+            k1 = k1 or 4
+            k2 = k2 or 2
+            k3 = k3 or 1
             error_model = "linear"
             if product in ['AI']:
                 oversampling_list = ['AI']
                 self.default_subset_function = 'F_subset_S5PAI'
             elif product in ['CH4']:
-                oversampling_list = ['XCH4']
+                oversampling_list = ['XCH4','xch4']
                 self.default_subset_function = 'F_subset_S5PCH4'
                 self.default_column_unit = 'mol/mol'
             elif product in ['NO2']:
                 self.default_subset_function = 'F_subset_S5PNO2'
                 oversampling_list = ['column_amount','albedo',\
-                                     'cloud_fraction']
+                                     'surface_altitude']
             elif product in ['SO2']:
                 self.default_subset_function = 'F_subset_S5PSO2'
                 oversampling_list = ['column_amount','albedo',\
-                                     'cloud_fraction']
+                                     'surface_altitude']
             elif product in ['CO']:
                 self.default_subset_function = 'F_subset_S5PCO'
                 oversampling_list = ['column_amount','albedo',\
-                                     'cloud_fraction']
+                                     'surface_altitude']
             elif product in ['HCHO']:
                 self.default_subset_function = 'F_subset_S5PHCHO'
                 oversampling_list = ['column_amount','albedo',\
-                                     'cloud_fraction']
+                                     'surface_altitude']
             xmargin = 1.5
             ymargin = 1.5
             maxsza = 70
@@ -2170,9 +2588,9 @@ class popy(object):
             self.pixel_shape = 'quadrilateral'
             self.default_column_unit = 'mol/m2'
         elif(instrum == "IASI"):
-            k1 = 2
-            k2 = 2
-            k3 = 9
+            k1 = k1 or 2
+            k2 = k2 or 2
+            k3 = k3 or 9
             error_model = "square"
             oversampling_list = ['column_amount']
             xmargin = 2
@@ -2183,9 +2601,9 @@ class popy(object):
             self.default_subset_function = 'F_subset_IASINH3'
             self.default_column_unit = 'mol/m2'
         elif(instrum == "CrIS"):
-            k1 = 2
-            k2 = 2
-            k3 = 4
+            k1 = k1 or 2
+            k2 = k2 or 2
+            k3 = k3 or 4
             error_model = "log"
             oversampling_list = ['column_amount']
             xmargin = 2
@@ -2198,9 +2616,9 @@ class popy(object):
             self.default_subset_function = 'F_subset_CrISNH3_Lite'
             self.default_column_unit = 'molec/cm2'
         elif(instrum == "TES"):
-            k1 = 4
-            k2 = 4
-            k3 = 1
+            k1 = k1 or 4
+            k2 = k2 or 4
+            k3 = k3 or 1
             error_model = "log"
             oversampling_list = ['column_amount']
             xmargin = 2
@@ -2212,9 +2630,9 @@ class popy(object):
             self.default_subset_function = 'F_subset_TESNH3'
             self.default_column_unit = 'molec/cm2'
         else:
-            k1 = 2
-            k2 = 2
-            k3 = 1
+            k1 = k1 or 2
+            k2 = k2 or 2
+            k3 = k3 or 1
             error_model = "linear"
             oversampling_list = ['column_amount']
             xmargin = 2
@@ -2230,11 +2648,14 @@ class popy(object):
         self.k1 = k1
         self.k2 = k2
         self.k3 = k3
+        self.inflatex = inflatex
+        self.inflatey = inflatey
         self.sg_kfacx = 2*(np.log(2)**(1/k1/k3))
         self.sg_kfacy = 2*(np.log(2)**(1/k2/k3))
         self.error_model = error_model
         self.oversampling_list = oversampling_list
         self.grid_size = grid_size
+        self.flux_grid_size = flux_grid_size or grid_size
         
         start_python_datetime = datetime.datetime(start_year,start_month,start_day,\
                                                   start_hour,start_minute,start_second)
@@ -2396,6 +2817,84 @@ class popy(object):
             self.logger.info('boundary polygon provided, further filtering l2g pixels...')
             self.F_mask_l2g_with_boundary(boundary_polygon=boundary_polygon,center_only=False)
     
+    def F_calculate_horizontal_flux(self,x_wind_field,y_wind_field,
+                                    func_to_get_vcd=None,
+                                    unique_layer_identifier=None,
+                                    interp_met_kw=None,
+                                    calculate_flux_divergence_kw=None):
+        '''add horizontal flux to l2g_data
+        x/y_wind_field:
+            key in l2g_data for east/north wind component, e.g., era5_u/v100
+        func_to_get_vcd:
+            function that takes in l2g_data dictionary and output a new l2g_data dictionary (useful to hack l2g_data),
+            or the vcd array
+        unique_layer_identifier:
+            name of l2g_data to identify unique layers for flux div calculation. l2g_data will be divided to a list
+            if it exists in l2g_data. each element will be a dict with a unique value of unique_layer_identifier
+        interp_met_kw:
+            if x/y_wind_field are not in l2g_data, call self.F_interp_met to get those fields
+        calculate_flux_divergence_kw:
+            arguments to Level3_Data().calculate_flux_divergence
+        output:
+            'flux_e','flux_n','flux_ne','flux_nw' added to l2g_data
+        created on 2022/06/15
+        '''
+        if unique_layer_identifier is None:
+            self.logger.warning('make sure your l2 data are not overlapping too much, otherwise provide unique_layer_identifier')
+        
+        interp_met_kw = interp_met_kw or {}
+        calculate_flux_divergence_kw = calculate_flux_divergence_kw or {}
+        self.calculate_flux_divergence_kw = calculate_flux_divergence_kw
+        
+        # vcd should be in mol/m2
+        if func_to_get_vcd is None:
+            self.logger.warning('the function to calculate vcd is not provided. use column_amount')
+            vcd = self.l2g_data['column_amount']
+        else:
+            tmp = func_to_get_vcd(self.l2g_data)
+            if isinstance(tmp,dict):
+                # self.l2g_data will be replaced by the output of func_to_get_vcd
+                self.l2g_data = func_to_get_vcd(self.l2g_data)
+                # preferably use the vcd field
+                if 'vcd' in self.l2g_data.keys():
+                    vcd = self.l2g_data['vcd']
+                else:
+                    vcd = self.l2g_data['column_amount']
+            else:
+                vcd = func_to_get_vcd(self.l2g_data)
+        
+        # wind should be in m/s
+        if (x_wind_field not in self.l2g_data.keys()) or (y_wind_field not in self.l2g_data.keys()):
+            self.logger.info('x/y_wind_field is unavailable in l2g_data. try sampling from met data')
+            self.F_interp_met(**interp_met_kw)
+            
+        # flux to the east, mol/m/s
+        self.l2g_data['flux_e'] = vcd*self.l2g_data[x_wind_field]
+        # flux to the north, mol/m/s
+        self.l2g_data['flux_n'] = vcd*self.l2g_data[y_wind_field]
+        # http://persweb.wabash.edu/facstaff/footer/courses/m225/handouts/divgradcurl3.pdf, page 8
+        ne2e_angle = np.arctan(1/(np.cos(self.l2g_data['latc']/180*np.pi)))
+        ne2e_cos = np.cos(ne2e_angle)
+        ne2e_sin = np.sin(ne2e_angle)
+        # flux to the northeast, mol/m/s
+        self.l2g_data['flux_ne'] = vcd*(self.l2g_data[x_wind_field]*ne2e_cos+self.l2g_data[y_wind_field]*ne2e_sin)
+        # flux to the northwest, mol/m/s
+        self.l2g_data['flux_nw'] = vcd*(self.l2g_data[x_wind_field]*(-ne2e_cos)+self.l2g_data[y_wind_field]*ne2e_sin)
+        # add 'vcd' to the oversampling list if it is not column_amount, e.g., derived from xch4
+        if func_to_get_vcd is not None:
+            self.l2g_data['vcd'] = vcd
+            self.oversampling_list.append('vcd')
+        add_list = ['flux_e','flux_n','flux_ne','flux_nw']
+        for add_field in add_list:
+            if add_field not in self.oversampling_list:
+                self.oversampling_list.append(add_field)
+        
+        # last step, if there is a unique identifier, divide l2g_data from a dict to a list of dict
+        if unique_layer_identifier in self.l2g_data.keys():
+            self.logger.info('l2g_data will be divided into a list according to {}'.format(unique_layer_identifier))
+            unique_values,unique_idx = np.unique(self.l2g_data[unique_layer_identifier],return_inverse=True)
+            self.l2g_data = [{k:v[unique_idx==i,] for k,v in self.l2g_data.items()} for i in range(len(unique_values))]
+            
     def F_load_l3_mat(self,l3_filename,boundary_polygon=None):
         '''
         load l3 mat files to l3_data dictionary
@@ -2463,6 +2962,7 @@ class popy(object):
         data_fields_l2g: what do you want to call the variables in the output
         updated on 2019/04/22
         updated on 2019/11/20 to handle SUB.nc
+        updated on 2022/06/19 to add orbit number
         additional packages:
             netCDF4, conda install -c anaconda netcdf4
         """
@@ -2501,6 +3001,8 @@ class popy(object):
         
         outp['across_track_position'] = np.tile(np.arange(1.,outp['latc'].shape[1]+1),\
             (outp['latc'].shape[0],1)).astype(np.int16)
+        outp['orbit'] = np.full(outp['latc'].shape,ncid.orbit,dtype=int)
+        ncid.close()
         return outp
     
     def F_read_MEaSUREs_nc(self,fn,data_fields,data_fields_l2g=None):
@@ -2628,91 +3130,6 @@ class popy(object):
                     (1.,outp_he5['latc'].shape[1]+1),\
                     (outp_he5['latc'].shape[0],1)).astype(np.int16)
         return outp_he5
-    
-    def F_update_popy_with_control_file(self,control_path):
-        """ 
-        function to update self with parameters found in control.txt
-        control_path: absolution path to control.txt
-        updated on 2019/04/22
-        additional packages: 
-            yaml, conda install -c anaconda yaml
-        """
-        import yaml
-        with open(control_path,'r') as stream:
-            control = yaml.load(stream)
-        l2_list = control['Input Files']['OMHCHO']
-        l2_dir = control['Runtime Parameters']['Lv2Dir']
-        
-        maxsza = float(control['Runtime Parameters']['maxSZA'])
-        maxcf = float(control['Runtime Parameters']['maxCfr'])
-        west = float(control['Runtime Parameters']['minLon'])
-        east = float(control['Runtime Parameters']['maxLon'])
-        south = float(control['Runtime Parameters']['minLat'])
-        north = float(control['Runtime Parameters']['maxLat'])
-        grid_size = float(control['Runtime Parameters']['res'])
-        maxMDQF= int(control['Runtime Parameters']['maxMDQF'])
-        maxEXTQF= int(control['Runtime Parameters']['maxEXTQF'])
-        self.maxsza = maxsza
-        self.maxcf = maxcf
-        self.west = west
-        self.east = east
-        self.south = south
-        self.north = north
-        self.grid_size = grid_size
-        self.maxMDQF = maxMDQF
-        self.maxEXTQF = maxEXTQF
-        xgrid = np.arange(west,east,grid_size,dtype=np.float64)+grid_size/2
-        ygrid = np.arange(south,north,grid_size,dtype=np.float64)+grid_size/2
-        [xmesh,ymesh] = np.meshgrid(xgrid,ygrid)
-
-        xgridr = np.hstack((np.arange(west,east,grid_size),east))
-        ygridr = np.hstack((np.arange(south,north,grid_size),north))
-        [xmeshr,ymeshr] = np.meshgrid(xgridr,ygridr)
-
-        self.xgrid = xgrid
-        self.ygrid = ygrid
-        self.xmesh = xmesh
-        self.ymesh = ymesh
-        self.xgridr = xgridr
-        self.ygridr = ygridr
-        self.xmeshr = xmeshr
-        self.ymeshr = ymeshr
-        self.nrows = len(ygrid)
-        self.ncols = len(xgrid)
-        
-        start_python_datetime = datetime.datetime.strptime(
-                control['Runtime Parameters']['StartTime'],'%Y-%m-%dT%H:%M:%Sz')
-        end_python_datetime = datetime.datetime.strptime(
-                control['Runtime Parameters']['EndTime'],'%Y-%m-%dT%H:%M:%Sz')
-        self.start_python_datetime = start_python_datetime
-        self.end_python_datetime = end_python_datetime
-        
-        self.tstart = start_python_datetime.strftime('%Y-%m-%dT%H:%M:%SZ')
-        self.tend = end_python_datetime.strftime('%Y-%m-%dT%H:%M:%SZ')
-        # most of my data are saved in matlab format, where time is defined as UTC days since 0000, Jan 0
-        start_matlab_datenum = (start_python_datetime.toordinal()\
-                                +start_python_datetime.hour/24.\
-                                +start_python_datetime.minute/1440.\
-                                +start_python_datetime.second/86400.+366.)
-        
-        end_matlab_datenum = (end_python_datetime.toordinal()\
-                                +end_python_datetime.hour/24.\
-                                +end_python_datetime.minute/1440.\
-                                +end_python_datetime.second/86400.+366.)
-        self.start_matlab_datenum = start_matlab_datenum
-        self.end_matlab_datenum = end_matlab_datenum
-        self.l2_list = l2_list
-        self.l2_dir = l2_dir
-        self.logger.info('The following parameters from control.txt will overwrite intital popy values:')
-        self.logger.info('maxsza = '+'%s'%maxsza)
-        self.logger.info('maxcf  = '+'%s'%maxcf)
-        self.logger.info('west   = '+'%s'%west)
-        self.logger.info('east   = '+'%s'%east)
-        self.logger.info('south  = '+'%s'%south)
-        self.logger.info('north  = '+'%s'%north)
-        self.logger.info('tstart = '+self.tstart)
-        self.logger.info('tend   = '+self.tend)
-        self.logger.info('res    = '+'%s'%self.grid_size)
             
     def F_subset_OMHCHO(self,path):
         """ 
@@ -3237,12 +3654,14 @@ class popy(object):
         else:
             self.nl2 = len(l2g_data['latc'])
     
-    def F_subset_S5PNO2(self,l2_path_pattern='S5P*L2__NO2____%Y%m%dT*.nc',
+    def F_subset_S5PNO2(self,l2_list=None,l2_path_pattern=None,
                         path=None,data_fields=None,data_fields_l2g=None,
                         s5p_product='*',
                         geos_interp_variables=None,geos_time_collection=''):
         """ 
         function to subset tropomi no2 level 2 data, calling self.F_read_S5P_nc
+        l2_list:
+            a list of level 2 file paths. If provided, l2_path_pattern will be ignored.
         l2_path_pattern:
             a format string indicating the path structure of level 2 data. e.g.,
             r'C:/data/*O2-CH4_%Y%m%dT*CO2proxy.nc' 
@@ -3266,7 +3685,7 @@ class popy(object):
         geos_interp_variables = geos_interp_variables or []
         # find out list of l2 files to subset
         if path is not None:
-            self.logger.warning('please use l2_path_pattern instead')
+            self.logger.warning('please use l2_list or l2_path_pattern instead')
             import glob
             l2_dir = path
             l2_list = []
@@ -3283,17 +3702,24 @@ class popy(object):
             self.l2_dir = l2_dir
             self.l2_list = l2_list
         else:
-            import glob
-            l2_list = []
-            start_date = self.start_python_datetime.date()
-            end_date = self.end_python_datetime.date()
-            days = (end_date-start_date).days+1
-            DATES = [start_date + datetime.timedelta(days=d) for d in range(days)]
-            for DATE in DATES:
-                flist = glob.glob(DATE.strftime(l2_path_pattern))
-                l2_list = l2_list+flist
+            if l2_list is None and l2_path_pattern is None:
+                self.logger.error('either l2_list or l2_path_pattern has to be provided!')
+                return
+            if l2_list is not None and l2_path_pattern is not None:
+                self.logger.info('both l2_list and l2_path_pattern are provided. l2_path_pattern will be overwritten')
+                l2_path_pattern = None
+            
+            if l2_list is None:
+                import glob
+                l2_list = []
+                start_date = self.start_python_datetime.date()
+                end_date = self.end_python_datetime.date()
+                days = (end_date-start_date).days+1
+                DATES = [start_date + datetime.timedelta(days=d) for d in range(days)]
+                for DATE in DATES:
+                    flist = glob.glob(DATE.strftime(l2_path_pattern))
+                    l2_list = l2_list+flist                 
             self.l2_list = l2_list
-        
         maxsza = self.maxsza
         maxcf = self.maxcf
         west = self.west
@@ -3311,6 +3737,7 @@ class popy(object):
                            '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/viewing_zenith_angle',\
                            '/PRODUCT/SUPPORT_DATA/INPUT_DATA/surface_albedo_nitrogendioxide_window',\
                            '/PRODUCT/SUPPORT_DATA/INPUT_DATA/surface_pressure',\
+                           '/PRODUCT/SUPPORT_DATA/INPUT_DATA/surface_altitude',\
                            '/PRODUCT/latitude',\
                            '/PRODUCT/longitude',\
                            '/PRODUCT/qa_value',\
@@ -3320,7 +3747,7 @@ class popy(object):
         if not data_fields_l2g:
             # standardized variable names in l2g file. should map one-on-one to data_fields
             data_fields_l2g = ['cloud_fraction','latitude_bounds','longitude_bounds','SolarZenithAngle',\
-                               'vza','albedo','surface_pressure','latc','lonc','qa_value','time_utc',\
+                               'vza','albedo','surface_pressure','surface_altitude','latc','lonc','qa_value','time_utc',\
                                'column_amount','column_uncertainty']
         self.logger.info('Read, subset, and store level 2 data to l2g_data')
         l2g_data = {}
@@ -3375,7 +3802,9 @@ class popy(object):
         else:
             self.nl2 = len(l2g_data['latc'])
             
-    def F_subset_S5PHCHO(self,path,s5p_product='*',geos_interp_variables=None,
+    def F_subset_S5PHCHO(self,l2_path_pattern='S5P*L2__HCHO___%Y%m%dT*.nc',
+                         path=None,data_fields=None,data_fields_l2g=None,
+                         s5p_product='*',geos_interp_variables=None,
                          geos_time_collection=''):
         """ 
         function to subset tropomi hcho level 2 data, calling self.F_read_S5P_nc
@@ -3391,15 +3820,12 @@ class popy(object):
             choose from inst3, tavg1, tavg3
         updated on 2019/04/30
         updated on 2019/06/20 to add s5p_product/geos_interp_variables option
+        updated on 2020/01/15 to simplify to l2_path_pattern
         """      
         geos_interp_variables = geos_interp_variables or []
-
         # find out list of l2 files to subset
-        if os.path.isfile(path):
-            self.F_update_popy_with_control_file(path)
-            l2_list = self.l2_list
-            l2_dir = self.l2_dir
-        else:
+        if path is not None:
+            self.logger.warning('please use l2_path_pattern instead')
             import glob
             l2_dir = path
             l2_list = []
@@ -3415,7 +3841,18 @@ class popy(object):
             os.chdir(cwd)
             self.l2_dir = l2_dir
             self.l2_list = l2_list
-        
+        else:
+            import glob
+            l2_list = []
+            start_date = self.start_python_datetime.date()
+            end_date = self.end_python_datetime.date()
+            days = (end_date-start_date).days+1
+            DATES = [start_date + datetime.timedelta(days=d) for d in range(days)]
+            for DATE in DATES:
+                flist = glob.glob(DATE.strftime(l2_path_pattern))
+                l2_list = l2_list+flist
+            self.l2_list = l2_list
+                
         maxsza = self.maxsza
         maxcf = self.maxcf
         west = self.west
@@ -3426,36 +3863,34 @@ class popy(object):
         
         # absolute path of useful variables in the nc file
         # not sure about cloud fraction
-        # the time_utc string is empty?! why are you doing this to the user!
-        data_fields = ['/PRODUCT/SUPPORT_DATA/INPUT_DATA/cloud_fraction_crb',\
-               '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/latitude_bounds',\
-               '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/longitude_bounds',\
-               '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/solar_zenith_angle',\
-               '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/viewing_zenith_angle',\
-               '/PRODUCT/SUPPORT_DATA/INPUT_DATA/surface_albedo',\
-               '/PRODUCT/latitude',\
-               '/PRODUCT/longitude',\
-               '/PRODUCT/qa_value',\
-               '/PRODUCT/time',\
-               '/PRODUCT/delta_time',\
-               '/PRODUCT/formaldehyde_tropospheric_vertical_column',\
-               '/PRODUCT/formaldehyde_tropospheric_vertical_column_precision']    
-        # standardized variable names in l2g file. should map one-on-one to data_fields
-        data_fields_l2g = ['cloud_fraction','latitude_bounds','longitude_bounds','SolarZenithAngle',\
-                           'vza','albedo','latc','lonc','qa_value','time','delta_time',\
-                           'column_amount','column_uncertainty']
+        if not data_fields:
+            data_fields = ['/PRODUCT/SUPPORT_DATA/INPUT_DATA/cloud_fraction_crb',\
+                   '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/latitude_bounds',\
+                   '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/longitude_bounds',\
+                   '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/solar_zenith_angle',\
+                   '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/viewing_zenith_angle',\
+                   '/PRODUCT/SUPPORT_DATA/INPUT_DATA/surface_albedo',\
+                   '/PRODUCT/latitude',\
+                   '/PRODUCT/longitude',\
+                   '/PRODUCT/qa_value',\
+                   '/PRODUCT/time',\
+                   '/PRODUCT/delta_time',\
+                   '/PRODUCT/formaldehyde_tropospheric_vertical_column',\
+                   '/PRODUCT/formaldehyde_tropospheric_vertical_column_precision']    
+        if not data_fields_l2g:
+            # standardized variable names in l2g file. should map one-on-one to data_fields
+            data_fields_l2g = ['cloud_fraction','latitude_bounds','longitude_bounds','SolarZenithAngle',\
+                               'vza','albedo','latc','lonc','qa_value','time','delta_time',\
+                               'column_amount','column_uncertainty']
         self.logger.info('Read, subset, and store level 2 data to l2g_data')
-        self.logger.info('Level 2 data are located at '+l2_dir)
         l2g_data = {}
         for fn in l2_list:
-            fn_dir = os.path.join(l2_dir,fn)
-            self.logger.info('Loading '+fn)
+            self.logger.info('Loading '+os.path.split(fn)[-1])
             try:
-                outp_nc = self.F_read_S5P_nc(fn_dir,data_fields,data_fields_l2g)
+                outp_nc = self.F_read_S5P_nc(fn,data_fields,data_fields_l2g)
             except Exception as e:
                 self.logger.warning(fn+' gives error:');
-                print(e)
-                input("Press Enter to continue...")
+                self.logger.warning(e)
                 continue
             if geos_interp_variables != []:
                 sounding_interp = F_interp_geos_mat(outp_nc['lonc'],outp_nc['latc'],outp_nc['UTC_matlab_datenum'],\
@@ -3500,31 +3935,121 @@ class popy(object):
         else:
             self.nl2 = len(l2g_data['latc'])
     
-    def F_subset_MethaneAIR(self,l2_path_pattern,data_fields=None,
-                            data_fields_l2g=None):
-        import glob
-        start_date = self.start_python_datetime.date()
-        end_date = self.end_python_datetime.date()
-        # for methanair, we go down to minutes instead of dates
-        start_dt = self.start_python_datetime
-        end_dt = self.end_python_datetime
-        minutes = int(np.ceil((end_dt - start_dt).seconds/60)+1)
-        MINUTES = [start_dt+datetime.timedelta(seconds=m*60) for m in range(minutes)]
-        days = (end_date-start_date).days+1
-        DATES = [start_date + datetime.timedelta(days=d) for d in range(days)]
-        if '%Y%m%dT%H%M' not in l2_path_pattern:
-            self.logger.warning('It is suggested to be accurate to minutes for MethaneAIR')
-            l2_dir = os.path.split(l2_path_pattern)[0]
-            l2_list = []
-            for DATE in DATES:
-                flist = glob.glob(DATE.strftime(l2_path_pattern))
-                l2_list = l2_list+flist
+    def F_subset_combined_MethaneAIR(self,path,alongtrack_mask=None,acrosstrack_mask=None,
+                                     oversampling_list=None,pixel_adjust_func=None,
+                                     singularity_mask=None):
+        '''
+        subset function for combined MethaneAIR L2 for a single research flight
+        '''
+        from netCDF4 import Dataset
+        start_tau = (self.start_python_datetime-datetime.datetime(1985,1,1)).total_seconds()/3600
+        end_tau = (self.end_python_datetime-datetime.datetime(1985,1,1)).total_seconds()/3600
+        if oversampling_list is None:
+            oversampling_list = ['alb0','xch4','xch4_0','xco2_0','h2o_vcd','rms','ch4_dofs',\
+            'co2_dofs','xch4_bias_corr','isrfsqz_w1','isrfsqz_w2',\
+            'xch4_bias_corr_tv','xch4_bias_corr_anom','plm_mask']
+        self.oversampling_list = oversampling_list
+        nc = Dataset(path,'r')
+#         acrosstrack_mask = None
+        if alongtrack_mask is None:
+            alongtrack_mask = np.ones(nc.dimensions['tmx'].size,dtype=bool)
+        if acrosstrack_mask is None:
+            acrosstrack_mask = np.ones(nc.dimensions['xmx'].size,dtype=bool)
+        lonc = nc['lon'][acrosstrack_mask,alongtrack_mask]
+        latc = nc['lat'][acrosstrack_mask,alongtrack_mask]
+        if nc['tau'].ndim == 2:
+            tau = nc['tau'][acrosstrack_mask,alongtrack_mask]
         else:
-            l2_dir = os.path.split(l2_path_pattern)[0]
-            l2_list = []
-            for MINUTE in MINUTES:
-                flist = glob.glob(MINUTE.strftime(l2_path_pattern))
-                l2_list = l2_list+flist
+            tau = np.broadcast_to(nc['tau'][alongtrack_mask],lonc.shape)
+        validmask = (lonc >= self.west) & (lonc <= self.east) \
+        & (latc >= self.south) & (latc <= self.north) & (tau >= start_tau) & (tau <= end_tau)
+        self.logger.info('there are {} l2 pixels'.format(np.sum(validmask)))
+        if np.sum(validmask) == 0:
+            self.l2g_data = {}
+            self.nl2 = 0
+            return
+        l2g_data = {}
+        l2g_data['lonc'] = lonc[validmask].ravel()
+        l2g_data['latc'] = latc[validmask].ravel()
+        l2g_data['UTC_matlab_datenum'] = tau[validmask].ravel()/24+725008.
+        if singularity_mask is not None:
+            singularity_mask = np.broadcast_to(singularity_mask[alongtrack_mask],lonc.shape)[validmask]
+        else:
+            singularity_mask = np.ones(len(l2g_data['lonc']),dtype=bool)
+        # and clon is changed also
+        if 'clon_1' in nc.variables.keys():
+            self.logger.warning('this appears to be clon1, clon2, clat1...')
+            l2g_data['lonr'] = np.column_stack([nc['clon_{}'.format(ic)][acrosstrack_mask,alongtrack_mask][validmask].ravel() 
+                                                for ic in range(1,5)])
+            l2g_data['latr'] = np.column_stack([nc['clat_{}'.format(ic)][acrosstrack_mask,alongtrack_mask][validmask].ravel() 
+                                                for ic in range(1,5)])
+        elif 'clon' in nc.variables.keys():
+            # assuming the corner order is rear right, rear left, front left, front right
+            # standardize to rear left, front left, front right, rear right
+            self.logger.warning('this appears to be clon, clat, ...')
+            l2g_data['lonr'] = np.column_stack([nc['clon'][acrosstrack_mask,alongtrack_mask,ic][validmask].ravel() 
+                                                for ic in [1,2,3,0]])
+            l2g_data['latr'] = np.column_stack([nc['clat'][acrosstrack_mask,alongtrack_mask,ic][validmask].ravel() 
+                                                for ic in [1,2,3,0]])
+            
+        else:
+            self.logger.error('can you be more confusing?!')
+            return
+        
+        if pixel_adjust_func is not None:
+            self.logger.warning('pixel corners will be manipulated according to pixel_adjust_func')
+            lonr,latr = pixel_adjust_func(l2g_data['lonr'][singularity_mask,],
+                                          l2g_data['latr'][singularity_mask,],
+                                          l2g_data['lonc'][singularity_mask],
+                                          l2g_data['latc'][singularity_mask])
+            l2g_data['lonr'][singularity_mask,] = lonr
+            l2g_data['latr'][singularity_mask,] = latr
+            
+        for field in oversampling_list:
+            l2g_data[field] = nc[field][acrosstrack_mask,alongtrack_mask][validmask].ravel() 
+        l2g_data['column_uncertainty'] = np.ones_like(l2g_data['latc'])
+        self.l2g_data = l2g_data
+        self.nl2 = len(l2g_data['latc'])
+        
+    def F_subset_MethaneAIR(self,l2_list=None,l2_path_pattern=None,data_fields=None,
+                            data_fields_l2g=None):
+        '''
+        use l2_list as the major argument instead of l2_path_pattern
+        '''
+        if l2_list is None and l2_path_pattern is None:
+            self.logger.error('either l2_list or l2_path_pattern has to be provided!')
+            return
+        if l2_list is not None and l2_path_pattern is not None:
+            self.logger.info('both l2_list and l2_path_pattern are provided. l2_path_pattern will be overwritten')
+            l2_path_pattern = None
+        
+        if l2_list is None:
+            import glob
+            start_date = self.start_python_datetime.date()
+            end_date = self.end_python_datetime.date()
+            # for methanair, we go down to minutes instead of dates
+            start_dt = self.start_python_datetime
+            end_dt = self.end_python_datetime
+            minutes = int(np.ceil((end_dt - start_dt).seconds/60)+1)
+            MINUTES = [start_dt+datetime.timedelta(seconds=m*60) for m in range(minutes)]
+            days = (end_date-start_date).days+1
+            DATES = [start_date + datetime.timedelta(days=d) for d in range(days)]
+            if '%Y%m%dT%H%M' not in l2_path_pattern:
+                self.logger.warning('It is suggested to be accurate to minutes for MethaneAIR')
+                l2_dir = os.path.split(l2_path_pattern)[0]
+                l2_list = []
+                for DATE in DATES:
+                    flist = glob.glob(DATE.strftime(l2_path_pattern))
+                    l2_list = l2_list+flist
+            else:
+                l2_dir = os.path.split(l2_path_pattern)[0]
+                l2_list = []
+                for MINUTE in MINUTES:
+                    flist = glob.glob(MINUTE.strftime(l2_path_pattern))
+                    l2_list = l2_list+flist
+        else:
+            l2_dir = 'unspecified location if l2_list is provided'
+        
         self.l2_dir = l2_dir
         self.l2_list = l2_list
         
@@ -3694,7 +4219,9 @@ class popy(object):
         else:
             self.nl2 = len(l2g_data['latc'])
 
-    def F_subset_S5PCH4(self,path,if_trop_xch4=False,s5p_product='*',
+    def F_subset_S5PCH4(self,l2_list=None,l2_path_pattern=None,
+                        path=None,data_fields=None,data_fields_l2g=None,
+                        if_trop_xch4=False,s5p_product='*',
                         merra2_interp_variables=None,
                         merra2_dir='./',
                         geos_interp_variables=None,geos_time_collection=''):
@@ -3702,8 +4229,17 @@ class popy(object):
         function to subset tropomi ch4 level 2 data, calling self.F_read_S5P_nc
         path: directory containing S5PCH4 level 2 files, OR path to control.txt
         for methane, many of auxiliary data are not saved as I trust qa_value
+        l2_list:
+            a list of level 2 file paths. If provided, l2_path_pattern will be ignored.
+        l2_path_pattern:
+            a format string indicating the path structure of level 2 data. e.g.,
+            r'C:/data/*O2-CH4_%Y%m%dT*CO2proxy.nc' 
         path:
             l2 data directory, or path to control file
+        data_fields:
+            a list of strings indicating which fields in the l2 file to keep
+        data_fields_l2g:
+            shortened data_fields used in the output dictionary l2g_data
         if_trop_xch4:
             if calculate tropospheric xch4
         s5p_product:
@@ -3721,16 +4257,14 @@ class popy(object):
         updated on 2019/05/08
         updated from 2019/05/24 to add tropospheric xch4
         updated on 2019/06/20 to include more interpolation options from geos fp
+        updated on 2022/06/26 to match other s5p functions
         """      
         from scipy.interpolate import interp1d
         merra2_interp_variables = merra2_interp_variables or ['TROPPT','PS','U50M','V50M']
         geos_interp_variables = geos_interp_variables or []
         # find out list of l2 files to subset
-        if os.path.isfile(path):
-            self.F_update_popy_with_control_file(path)
-            l2_list = self.l2_list
-            l2_dir = self.l2_dir
-        else:
+        if path is not None:
+            self.logger.warning('please use l2_list or l2_path_pattern instead')
             import glob
             l2_dir = path
             l2_list = []
@@ -3743,9 +4277,27 @@ class popy(object):
             for DATE in DATES:
                 flist = glob.glob('S5P_'+s5p_product+'_L2__CH4____'+DATE.strftime("%Y%m%d")+'T*.nc')
                 l2_list = l2_list+flist
-            
             os.chdir(cwd)
             self.l2_dir = l2_dir
+            self.l2_list = l2_list
+        else:
+            if l2_list is None and l2_path_pattern is None:
+                self.logger.error('either l2_list or l2_path_pattern has to be provided!')
+                return
+            if l2_list is not None and l2_path_pattern is not None:
+                self.logger.info('both l2_list and l2_path_pattern are provided. l2_path_pattern will be overwritten')
+                l2_path_pattern = None
+            
+            if l2_list is None:
+                import glob
+                l2_list = []
+                start_date = self.start_python_datetime.date()
+                end_date = self.end_python_datetime.date()
+                days = (end_date-start_date).days+1
+                DATES = [start_date + datetime.timedelta(days=d) for d in range(days)]
+                for DATE in DATES:
+                    flist = glob.glob(DATE.strftime(l2_path_pattern))
+                    l2_list = l2_list+flist                 
             self.l2_list = l2_list
         
         #maxsza = self.maxsza 
@@ -3756,23 +4308,28 @@ class popy(object):
         north = self.north
         min_qa_value = self.min_qa_value
         
-        # absolute path of useful variables in the nc file
-        data_fields = ['/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/latitude_bounds',\
-               '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/longitude_bounds',\
-               '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/solar_zenith_angle',\
-               '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/viewing_zenith_angle',\
-               '/PRODUCT/latitude',\
-               '/PRODUCT/longitude',\
-               '/PRODUCT/qa_value',\
-               '/PRODUCT/time',\
-               '/PRODUCT/delta_time',\
-               '/PRODUCT/methane_mixing_ratio',\
-               '/PRODUCT/methane_mixing_ratio_bias_corrected',\
-               '/PRODUCT/methane_mixing_ratio_precision']    
-        # standardized variable names in l2g file. should map one-on-one to data_fields
-        data_fields_l2g = ['latitude_bounds','longitude_bounds','SolarZenithAngle',\
-                           'vza','latc','lonc','qa_value','time','delta_time',\
-                           'XCH4_no_bias_correction','XCH4','column_uncertainty']
+        if not data_fields:
+            # absolute path of useful variables in the nc file
+            data_fields = ['/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/latitude_bounds',\
+                           '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/longitude_bounds',\
+                           '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/solar_zenith_angle',\
+                           '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/viewing_zenith_angle',\
+                           '/PRODUCT/latitude',\
+                           '/PRODUCT/longitude',\
+                           '/PRODUCT/qa_value',\
+                           '/PRODUCT/time',\
+                           '/PRODUCT/delta_time',\
+                           '/PRODUCT/methane_mixing_ratio',\
+                           '/PRODUCT/methane_mixing_ratio_bias_corrected',\
+                           '/PRODUCT/methane_mixing_ratio_precision',
+                          '/PRODUCT/SUPPORT_DATA/INPUT_DATA/surface_pressure',\
+                          '/PRODUCT/SUPPORT_DATA/INPUT_DATA/surface_altitude']    
+        if not data_fields_l2g:
+            # standardized variable names in l2g file. should map one-on-one to data_fields
+            data_fields_l2g = ['latitude_bounds','longitude_bounds','SolarZenithAngle',\
+                               'vza','latc','lonc','qa_value','time','delta_time',\
+                               'XCH4_no_bias_correction','XCH4','column_uncertainty',
+                              'surface_pressure','surface_altitude']
         if if_trop_xch4:
              # absolute path of useful variables in the nc file
              data_fields = ['/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/latitude_bounds',\
@@ -3800,17 +4357,16 @@ class popy(object):
                                 'XCH4_no_bias_correction','XCH4','column_uncertainty',\
                                 'albedo','surface_altitude']
         self.logger.info('Read, subset, and store level 2 data to l2g_data')
-        self.logger.info('Level 2 data are located at '+l2_dir)
+        
         l2g_data = {}
         for fn in l2_list:
-            fn_path = os.path.join(l2_dir,fn)
-            self.logger.info('Loading '+fn)
+            self.logger.info('Loading '+os.path.split(fn)[-1])
+            
             try:
-                outp_nc = self.F_read_S5P_nc(fn_path,data_fields,data_fields_l2g)
+                outp_nc = self.F_read_S5P_nc(fn,data_fields,data_fields_l2g)
             except Exception as e:
-                self.logger.warning(fn+' gives error:');
-                print(e)
-                input("Press Enter to continue...")
+                self.logger.warning(fn+' gives error:')
+                self.logger.warning(e)
                 continue
             
 #            if if_trop_xch4:
@@ -3890,31 +4446,20 @@ class popy(object):
         else:
             self.nl2 = len(l2g_data['latc'])
     
-    def F_subset_S5PCO(self,path,s5p_product='*',geos_interp_variables=None,
-                        geos_time_collection=''):
+    def F_subset_S5PCO(self,l2_list=None,l2_path_pattern=None,
+                       path=None,data_fields=None,data_fields_l2g=None,
+                       s5p_product='*',geos_interp_variables=None,
+                       geos_time_collection=''):
         """ 
         function to subset tropomi co level 2 data, calling self.F_read_S5P_nc
-        path:
-            l2 data directory, or path to control file
-        s5p_product:
-            choose from RPRO and OFFL, default is combining all (RPRO, OFFL, Near real time)
-        geos_interp_variables:
-            a list of variables (only 2d fields are supported now) to be 
-            resampled from geos fp (has to be subsetted/resaved into .mat). see
-            the geos class for geos fp data handling
-        geos_time_collection:
-            choose from inst3, tavg1, tavg3
         created on 2019/08/12 based on F_subset_S5PNO2
+        updated on 2022/06/24
         """    
         geos_interp_variables = geos_interp_variables or []
 
         # find out list of l2 files to subset
-        if os.path.isfile(path):
-            self.F_update_popy_with_control_file(path)
-            l2_list = self.l2_list
-            l2_dir = self.l2_dir
-        else:
-            import glob
+        if path is not None:
+            self.logger.warning('please use l2_list or l2_path_pattern instead')
             l2_dir = path
             l2_list = []
             cwd = os.getcwd()
@@ -3929,6 +4474,24 @@ class popy(object):
             os.chdir(cwd)
             self.l2_dir = l2_dir
             self.l2_list = l2_list
+        else:
+            if l2_list is None and l2_path_pattern is None:
+                self.logger.error('either l2_list or l2_path_pattern has to be provided!')
+                return
+            if l2_list is not None and l2_path_pattern is not None:
+                self.logger.info('both l2_list and l2_path_pattern are provided. l2_path_pattern will be overwritten')
+                l2_path_pattern = None
+            
+            if l2_list is None:
+                l2_list = []
+                start_date = self.start_python_datetime.date()
+                end_date = self.end_python_datetime.date()
+                days = (end_date-start_date).days+1
+                DATES = [start_date + datetime.timedelta(days=d) for d in range(days)]
+                for DATE in DATES:
+                    flist = glob.glob(DATE.strftime(l2_path_pattern))
+                    l2_list = l2_list+flist                 
+            self.l2_list = l2_list
         
         maxsza = self.maxsza
         #maxcf = self.maxcf
@@ -3938,37 +4501,38 @@ class popy(object):
         north = self.north
         min_qa_value = self.min_qa_value
         
-        # absolute path of useful variables in the nc file
-        data_fields = ['/PRODUCT/SUPPORT_DATA/DETAILED_RESULTS/scattering_optical_thickness_SWIR',\
-                       '/PRODUCT/SUPPORT_DATA/DETAILED_RESULTS/water_total_column',\
-                       '/PRODUCT/SUPPORT_DATA/DETAILED_RESULTS/height_scattering_layer',\
-               '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/latitude_bounds',\
-               '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/longitude_bounds',\
-               '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/solar_zenith_angle',\
-               '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/viewing_zenith_angle',\
-               '/PRODUCT/SUPPORT_DATA/INPUT_DATA/surface_pressure',\
-               '/PRODUCT/latitude',\
-               '/PRODUCT/longitude',\
-               '/PRODUCT/qa_value',\
-               '/PRODUCT/time_utc',\
-               '/PRODUCT/carbonmonoxide_total_column',\
-               '/PRODUCT/carbonmonoxide_total_column_precision']    
-        # standardized variable names in l2g file. should map one-on-one to data_fields
-        data_fields_l2g = ['scattering_OD','colh2o','scattering_height','latitude_bounds','longitude_bounds','SolarZenithAngle',\
-                           'vza','surface_pressure','latc','lonc','qa_value','time_utc',\
-                           'column_amount','column_uncertainty']
+        if not data_fields:
+            # absolute path of useful variables in the nc file
+            data_fields = ['/PRODUCT/SUPPORT_DATA/DETAILED_RESULTS/scattering_optical_thickness_SWIR',\
+                           '/PRODUCT/SUPPORT_DATA/DETAILED_RESULTS/water_total_column',\
+                           '/PRODUCT/SUPPORT_DATA/DETAILED_RESULTS/height_scattering_layer',\
+                           '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/latitude_bounds',\
+                           '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/longitude_bounds',\
+                           '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/solar_zenith_angle',\
+                           '/PRODUCT/SUPPORT_DATA/GEOLOCATIONS/viewing_zenith_angle',\
+                           '/PRODUCT/SUPPORT_DATA/INPUT_DATA/surface_pressure',\
+                           '/PRODUCT/SUPPORT_DATA/INPUT_DATA/surface_altitude',\
+                           '/PRODUCT/latitude',\
+                           '/PRODUCT/longitude',\
+                           '/PRODUCT/qa_value',\
+                           '/PRODUCT/time_utc',\
+                           '/PRODUCT/carbonmonoxide_total_column',\
+                           '/PRODUCT/carbonmonoxide_total_column_precision']    
+        if not data_fields_l2g:
+            # standardized variable names in l2g file. should map one-on-one to data_fields
+            data_fields_l2g = ['scattering_OD','colh2o','scattering_height','latitude_bounds','longitude_bounds','SolarZenithAngle',\
+                               'vza','surface_pressure','surface_altitude','latc','lonc','qa_value','time_utc',\
+                               'column_amount','column_uncertainty']
         self.logger.info('Read, subset, and store level 2 data to l2g_data')
-        self.logger.info('Level 2 data are located at '+l2_dir)
+        
         l2g_data = {}
         for fn in l2_list:
-            fn_dir = os.path.join(l2_dir,fn)
-            self.logger.info('Loading '+fn)
+            self.logger.info('Loading '+os.path.split(fn)[-1])
             try:
-                outp_nc = self.F_read_S5P_nc(fn_dir,data_fields,data_fields_l2g)
+                outp_nc = self.F_read_S5P_nc(fn,data_fields,data_fields_l2g)
             except Exception as e:
                 self.logger.warning(fn+' gives error:');
-                print(e)
-                input("Press Enter to continue...")
+                self.logger.warning(e)
                 continue
             if geos_interp_variables != []:
                 sounding_interp = F_interp_geos_mat(outp_nc['lonc'],outp_nc['latc'],outp_nc['UTC_matlab_datenum'],\
@@ -5648,6 +6212,18 @@ class popy(object):
         created on 2020/07/19
         fix on 2020/08/17 so multiprocess does not consume all the memory
         '''
+        if l2g_data == None:
+            l2g_data = self.l2g_data
+        if isinstance(l2g_data,list):
+            self.logger.info('l2g_data appears to be a list. each unique layer will be oversampled, coarsened, flux-generated separately, and then merged')
+            l3_object = Level3_Data(proj=self.proj,grid_size=self.flux_grid_size)
+            for l2g in l2g_data:
+                l3_orbit = self.F_parallel_regrid(l2g,block_length,ncores).block_reduce(self.flux_grid_size)
+                l3_orbit.calculate_flux_divergence(**self.calculate_flux_divergence_kw)
+                l3_object = l3_object.merge(l3_orbit)
+            l3_object.check()
+            return l3_object
+        
         west = self.west ; east = self.east ; south = self.south ; north = self.north
         nrows = self.nrows; ncols = self.ncols
         xmesh = self.xmesh ; ymesh = self.ymesh
@@ -5656,8 +6232,7 @@ class popy(object):
         start_matlab_datenum = self.start_matlab_datenum
         end_matlab_datenum = self.end_matlab_datenum
         oversampling_list = self.oversampling_list.copy()
-        if l2g_data == None:
-            l2g_data = self.l2g_data
+        
         if 'UTC_matlab_datenum' not in l2g_data.keys():
             l2g_data['UTC_matlab_datenum'] = l2g_data.pop('utc')
         for key in self.oversampling_list:
@@ -5672,7 +6247,7 @@ class popy(object):
             l3_data = F_block_regrid_ccm(l2g_data,xmesh,ymesh,
                        oversampling_list,self.pixel_shape,self.error_model,
                        self.k1,self.k2,self.k3,xmargin,ymargin,
-                       iblock=1)
+                       iblock=1,inflatex=self.inflatex,inflatey=self.inflatey)
             l3_data['xgrid'] = self.xgrid
             l3_data['ygrid'] = self.ygrid
             l3_object = Level3_Data(grid_size=self.grid_size,
@@ -5722,8 +6297,9 @@ class popy(object):
         if 'lonr' in l2g_data.keys():
             lonr = l2g_data['lonr']
             latr = l2g_data['latr']
-            pixel_width = np.max([F_lon_distance(lonr[:,0],lonr[:,2]),F_lon_distance(lonr[:,1],lonr[:,3])],axis=0)
-            pixel_height = np.max([np.abs(latr[:,2]-latr[:,0]),np.abs(latr[:,1]-latr[:,3])],axis=0)
+            # this will break if a pixel spans the +/-180 longitude
+            pixel_width = np.ptp(lonr,axis=1)
+            pixel_height = np.ptp(latr,axis=1)
         else:
             pixel_width = np.max([l2g_data['u'],l2g_data['v']],axis=0)*3
             pixel_height = pixel_width
@@ -5757,7 +6333,7 @@ class popy(object):
                           block_ymesh[iblock],oversampling_list,\
                           self.pixel_shape,self.error_model, \
                           self.k1,self.k2,self.k3,
-                          xmargin,ymargin,iblock,self.verbose) for iblock in range(nblock) ) )
+                          xmargin,ymargin,iblock,self.verbose,self.inflatex,self.inflatey) for iblock in range(nblock) ) )
 #        pp = multiprocessing.Pool(ncores)
 #        l3_data_list = pp.map( F_block_regrid_wrapper, \
 #                        ((block_l2g_data[iblock],block_xmesh[iblock],\
@@ -5902,14 +6478,8 @@ class popy(object):
                           block_ymesh[iblock],oversampling_list,\
                           self.pixel_shape,self.error_model, \
                           self.k1,self.k2,self.k3,
-                          xmargin,ymargin,iblock,self.verbose) for iblock in range(nblock) ) )
-#        pp = multiprocessing.Pool(ncores)
-#        l3_data_list = pp.map( F_block_regrid_wrapper, \
-#                        ((block_l2g_data[iblock],block_xmesh[iblock],\
-#                          block_ymesh[iblock],oversampling_list,\
-#                          self.instrum,self.error_model, \
-#                          self.k1,self.k2,self.k3,
-#                          xmargin,ymargin,iblock) for iblock in range(nblock) ) )
+                          xmargin,ymargin,iblock,self.verbose,self.inflatex,self.inflatey) for iblock in range(nblock) ) )
+        
         self.logger.info('Reassemble blocks back to l3 grid')
         dict_of_lists = {}
         for iblock in range(nblock):
@@ -6644,16 +7214,16 @@ class popy(object):
             self.l2g_data['gcrs_plevel'] = sounding_pEdge
             self.logger.info('GEOS-Chem profiles sampled at level 2 g locations')
     
-    def F_interp_met(self,which_met,met_dir,interp_fields,fn_header='',
+    def F_interp_met(self,which_met,met_dir,interp_fields,fn_header=None,
                      time_collection='inst3'):
         """
         finally made the decision to integrate all meteorological interopolation
         to the same framework.
         which_met:
-            a string, choosen from 'ERA5', 'NARR', 'GEOS-FP', 'MERRA-2'
+            a string, choosen from 'ERA5', 'NARR', 'GEOS-FP', 'MERRA-2', 'HRRR'
         met_dir:
             directory containing those met data, data structure should be consistently
-            Y%Y/M%M/D%D
+            Y%Y/M%M/D%D, except for HRRR (implemented in 2022 and file_path should be used)
         interp_fields:
             variables to interpolate from met data, only 2d fields are supported
         fn_header:
@@ -6662,16 +7232,15 @@ class popy(object):
             only useful for geos fp. see F_interp_geos_mat
         created on 2020/03/04
         """
+        if self.nl2 == 0:
+            self.logger.warning('no l2 data to sample met')
+            return
         sounding_lon = self.l2g_data['lonc']
         sounding_lat = self.l2g_data['latc']
         sounding_datenum = self.l2g_data['UTC_matlab_datenum']
         if which_met in {'era','era5','ERA','ERA5'}:
-            if not fn_header:
-                fn_header_local = 'CONUS'
-            else:
-                fn_header_local = fn_header
             sounding_interp = F_interp_era5(sounding_lon,sounding_lat,sounding_datenum,
-                                            met_dir,interp_fields,fn_header_local)
+                                            met_dir,interp_fields,fn_header)
             for key in sounding_interp.keys():
                 self.logger.info(key+' from ERA5 is sampled to L2g coordinate/time')
                 self.l2g_data['era5_'+key] = np.float32(sounding_interp[key])
@@ -6706,6 +7275,12 @@ class popy(object):
             for key in sounding_interp.keys():
                 self.logger.info(key+' from MERRA2 is sampled to L2g coordinate/time')
                 self.l2g_data['merra2_'+key] = np.float32(sounding_interp[key])
+        elif which_met.lower() == 'hrrr':
+            sounding_interp = F_interp_hrrr_mat(sounding_lon,sounding_lat,sounding_datenum,
+                                                met_dir,interp_fields)
+            for key in sounding_interp.keys():
+                self.logger.info(key+' from HRRR is sampled to L2g coordinate/time')
+                self.l2g_data['hrrr_'+key] = np.float32(sounding_interp[key])
     
     def F_label_HMS(self,HMS_dir,fn_date_identifier='%Y/%m/%d/hms_smoke%Y%m%d.shp'):
         '''
