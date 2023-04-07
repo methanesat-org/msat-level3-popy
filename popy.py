@@ -2065,10 +2065,12 @@ class Level3_Data(dict):
             if key in ['xgrid','ygrid','nrows','nrow','ncols','ncol','xmesh','ymesh','lonmesh','latmesh']:
                 continue
             elif key in ['total_sample_weight','pres_total_sample_weight','num_samples','pres_num_samples']:
-                interpolated_fields = np.zeros((len(ygrid),len(xgrid)))
+                # TODO: Comment; consider other areas needing the same treatment; consider downsides
+                interpolated_fields = np.zeros((len(ygrid),len(xgrid)),dtype=self[key].dtype)
                 interpolated_fields[np.ix_(ygrid_mask,xgrid_mask)] = self[key]
             else:
-                interpolated_fields = np.full((len(ygrid),len(xgrid)),np.nan)
+                # TODO: Comment; consider other areas needing the same treatment; consider downsides
+                interpolated_fields = np.full((len(ygrid),len(xgrid)),np.nan,dtype=self[key].dtype)
                 interpolated_fields[np.ix_(ygrid_mask,xgrid_mask)] = self[key]
             l3_new.add(key,interpolated_fields)
         l3_new.check()
@@ -2495,9 +2497,10 @@ class Level3_Data(dict):
             v1 = l3_data1[key]
             
             if key in ['total_sample_weight','pres_total_sample_weight','num_samples','pres_num_samples']:
-                v0[np.isnan(v0)] = 0.
-                v1[np.isnan(v1)] = 0.
-                l3_data[key] = v0+v1
+                # l3_data[key] will only be a view since the two operands being added are of the same shape
+                # and data type.
+                # TODO: Ensure that's acceptable. If not, either do a deep copy at the end or revert the change.
+                l3_data[key] = np.nan_to_num(v0,copy=False)+np.nan_to_num(v1,copy=False)
             elif key in initial_only_keys:
                 l3_data[key] = v0
             elif key == 'cloud_pressure':
@@ -2505,10 +2508,9 @@ class Level3_Data(dict):
                 below = np.nansum(np.array([self['pres_total_sample_weight'],l3_data1['pres_total_sample_weight']]),axis=0)
                 l3_data[key] = above/below
             else:
-                weight0 = self['total_sample_weight'].copy()
-                weight0[np.isnan(v0)] = 0
-                weight1 = l3_data1['total_sample_weight'].copy()
-                weight1[np.isnan(v1)] = 0
+                # TODO: Comment about the benefits of creating a view rather than a copy in terms of memory savings
+                weight0 = np.nan_to_num(self['total_sample_weight'],copy=False)
+                weight1 = np.nan_to_num(l3_data1['total_sample_weight'],copy=False)
                 above = np.nansum(np.array([v0*weight0,v1*weight1]),axis=0)
                 below = np.nansum(np.array([weight0,weight1]),axis=0)
                 l3_data[key] = above/below
