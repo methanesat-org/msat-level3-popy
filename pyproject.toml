@@ -25,7 +25,7 @@ dependencies = [
     "scipy~=1.8.1",
     "scikit-image>=0.19.3", # necessary for Level3_Data.block_reduce()
 ]
-version = "0.2.1"
+version = "0.2.2"
 
 [project.optional-dependencies]
 h5py = [
